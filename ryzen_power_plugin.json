@@ -1,0 +1,9 @@
+{
+    "KPlugin": {
+        "Name": "Ryzen CPU Power (Dragon Range)",
+        "Description": "CPU package power and temps for AMD Ryzen Dragon Range (8940HX) via ryzen_smu pm_table",
+        "Version": "1.0",
+        "License": "LGPL-2.0-or-later",
+        "EnabledByDefault": true
+    }
+}
