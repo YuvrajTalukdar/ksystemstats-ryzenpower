@@ -1,237 +1,163 @@
 # Adding Support for a New AMD CPU
 
-This guide walks you through mapping the `ryzen_smu` pm_table offsets for a new AMD CPU family and adding it to the plugin.
+Since the 2026-09-27 rework, the plugin reads CPU package power from the kernel-native
+**RAPL** powercap interface (`/sys/class/powercap/<domain>/energy_uj`) — the same source btop and
+Mission Control use. There are **no per-chip offsets or constants to map anymore**: the plugin
+scans `/sys/class/powercap` at startup and uses whichever domain is named `package*`.
+
+**If your chip exposes a RAPL `package` domain, the plugin works as-is — no source changes needed.**
+This guide is what to check and verify.
+
+> The pre-2026-09-27 version of this file (step-by-step `ryzen_smu` pm_table offset mapping) is
+> still in the git history: `git show 8fc32e6:ADDING_CPU_SUPPORT.md`.
 
 ---
 
-## Prerequisites
+## Step 1 — Does your chip expose RAPL?
 
-- `ryzen_smu` kernel module loaded and `/sys/kernel/ryzen_smu_drv/pm_table` readable
-- `python3` available
-- The CPU under test should be running Arch Linux or similar with `stress` installed (`sudo pacman -S stress`)
+```bash
+ls /sys/class/powercap/
+# and show what each domain is named:
+for d in /sys/class/powercap/*; do
+  [ -f "$d/name" ] && printf '%-16s %s\n' "$(basename "$d")" "$(cat "$d/name")"
+done
+```
+
+You want a domain whose name starts with `package`, e.g.:
+
+```
+intel-rapl        intel-rapl:0    package-0
+intel-rapl:0:0    core
+```
+
+- **`package-0` present** → good, go to Step 2. The plugin picks it up automatically (it matches on
+  the domain *name*, not the device name, so a different `intel-rapl:N` numbering still works).
+- **No `package*` domain** → the plugin has no data source on this chip: it logs a warning
+  (`journalctl --user -u plasma-ksystemstats`) and registers no sensors. See Step 4.
+
+Also check readability (the plugin runs unprivileged):
+
+```bash
+sudo -u nobody cat /sys/class/powercap/intel-rapl:0/energy_uj && echo readable
+```
+
+If not readable, install the udev rule from the repo:
+
+```bash
+sudo cp 99-ryzen-powercap-readable.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules
+sudo udevadm trigger --subsystem-match=powercap
+```
+
+> Note: that rule only matches `KERNEL=="intel-rapl*"`. If your chip exposes RAPL under a different
+> device name, the rule needs adjusting (same pattern, different `KERNEL==`).
 
 ---
 
-## Step 1 — Check your CPU family
-
-First confirm `ryzen_smu` recognises your chip:
+## Step 2 — Build, install, sanity-check
 
 ```bash
-cat /sys/kernel/ryzen_smu_drv/pm_table_version
-cat /sys/kernel/ryzen_smu_drv/pm_table_size
-```
-
-Note both values. The pm_table version and size are different for each CPU family:
-
-| CPU Family | Example chips | pm_table version | pm_table size |
-|---|---|---|---|
-| Cezanne | 5600H, 5800H | 400005 | ~936 bytes |
-| Rembrandt | 6800H, 6900HX | 450004 | ~1476 bytes |
-| Dragon Range | 8940HX, 8945HX | 400005 | 2256 bytes |
-| Phoenix | 7840HS, 7940H | 450005 | ~2340 bytes |
-
-Note: Dragon Range and Cezanne share the same version string (400005) but have completely different layouts and different sizes — **always check the size too**.
-
-Also check your CPU family string:
-```bash
-sudo ryzenadj --info 2>&1 | grep "CPU Family"
-```
-
----
-
-## Step 2 — Capture idle and load snapshots
-
-Run this script **at idle** (no heavy processes running, wait 30 seconds after boot):
-
-```bash
-python3 -c "
-import struct
-with open('/sys/kernel/ryzen_smu_drv/pm_table', 'rb') as f:
-    data = f.read()
-floats = struct.unpack_from(f'{len(data)//4}f', data)
-print(f'Total floats: {len(floats)}')
-for i, v in enumerate(floats):
-    if 1 < v < 200 or 30 < v < 110 or 400 < v < 6000:
-        print(f'[{i:03d}] {v:.4f}')
-" > /tmp/pm_idle.txt
-echo "Idle snapshot saved to /tmp/pm_idle.txt"
-```
-
-Then start a stress test in another terminal:
-```bash
-stress -c $(nproc)
-```
-
-Wait 30 seconds for power to stabilise, then run the load snapshot:
-```bash
-python3 -c "
-import struct
-with open('/sys/kernel/ryzen_smu_drv/pm_table', 'rb') as f:
-    data = f.read()
-floats = struct.unpack_from(f'{len(data)//4}f', data)
-print(f'Total floats: {len(floats)}')
-for i, v in enumerate(floats):
-    if 1 < v < 200 or 30 < v < 110 or 400 < v < 6000:
-        print(f'[{i:03d}] {v:.4f}')
-" > /tmp/pm_load.txt
-echo "Load snapshot saved to /tmp/pm_load.txt"
-
-# Stop stress test
-killall stress
-```
-
----
-
-## Step 3 — Compare idle vs load to identify indices
-
-Run this comparison script to find indices that changed significantly:
-
-```bash
-python3 << 'EOF'
-import re
-
-def parse_snapshot(path):
-    result = {}
-    with open(path) as f:
-        for line in f:
-            m = re.match(r'\[(\d+)\]\s+([\d.]+)', line)
-            if m:
-                result[int(m.group(1))] = float(m.group(2))
-    return result
-
-idle = parse_snapshot('/tmp/pm_idle.txt')
-load = parse_snapshot('/tmp/pm_load.txt')
-
-all_keys = sorted(set(list(idle.keys()) + list(load.keys())))
-
-print(f"{'Index':<8} {'Idle':>10} {'Load':>10} {'Delta':>10}  Likely meaning")
-print('-' * 65)
-
-for k in all_keys:
-    i = idle.get(k, 0)
-    l = load.get(k, 0)
-    delta = l - i
-    if abs(delta) < 2:
-        continue
-
-    note = ''
-    if abs(delta) > 30 and 1 < l < 200:
-        note = '*** LARGE CHANGE — likely power or temp'
-    elif 50 < l < 110 and 50 < i < 110:
-        note = 'likely temperature (C)'
-    elif 1 < l < 200:
-        note = 'likely power (W) or freq (MHz/100)'
-    elif l > 400:
-        note = 'likely frequency (MHz)'
-
-    print(f'[{k:03d}]    {i:10.3f} {l:10.3f} {delta:+10.3f}  {note}')
-EOF
-```
-
----
-
-## Step 4 — Identify specific indices
-
-Look for these patterns in the comparison output:
-
-### Power indices (W)
-- **Rises sharply from ~5-15W at idle to 30-100W under load** = actual power draw
-- **Stays constant regardless of load** = power limits set by ryzenadj/EC
-- The index with the largest delta that stays below 200W is usually **Package Power**
-
-### Temperature indices (°C)
-- **Idle around 40-65°C, load around 70-95°C** = CPU temperatures
-- The highest-value temp under load that matches what `sensors` reports for Tctl = **Tctl index**
-- Indices in a consecutive block (e.g. 16 in a row) with similar values = **per-core temps**
-
-### Verify against known tools
-
-Cross-check your identified indices against `sensors` output:
-```bash
-# Run simultaneously with stress test
-watch -n 1 'sensors | grep -E "Tctl|Tccd|PPT|fan"'
-```
-
-And against the pm_table in real time:
-```bash
-# Replace INDEX with your candidate index
-watch -n 1 'python3 -c "
-import struct
-with open(\"/sys/kernel/ryzen_smu_drv/pm_table\", \"rb\") as f:
-    data = f.read()
-floats = struct.unpack_from(f\"{len(data)//4}f\", data)
-print(f\"index[INDEX] = {floats[INDEX]:.2f}\")
-"'
-```
-
-If the value tracks what `sensors` shows for Tctl, you have the right index.
-
----
-
-## Step 5 — Update the plugin source
-
-Once you have confirmed indices, open `ryzen_power_plugin.cpp` and update the constants at the top:
-
-```cpp
-// Replace these with your CPU's verified indices
-static constexpr int IDX_PKG_POWER    = XX;  // CPU package power (W)
-static constexpr int IDX_FAST_LIMIT   = XX;  // PPT fast limit (W)
-static constexpr int IDX_FAST_ACTUAL  = XX;  // PPT fast actual (W)
-static constexpr int IDX_SLOW_LIMIT   = XX;  // PPT slow limit (W)
-static constexpr int IDX_SLOW_ACTUAL  = XX;  // PPT slow actual (W)
-static constexpr int IDX_STAPM_LIMIT  = XX;  // STAPM limit (W)
-static constexpr int IDX_STAPM_ACTUAL = XX;  // STAPM rolling average (W)
-static constexpr int IDX_TCTL         = XX;  // CPU die temp (C)
-static constexpr int IDX_HOTSPOT      = XX;  // Core hotspot temp (C)
-static constexpr int IDX_CORE_START   = XX;  // First core temp (C)
-static constexpr int NUM_CORES        = XX;  // Number of cores
-```
-
-Then rebuild and reinstall:
-```bash
-rm -rf build
 cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr
 cmake --build build -j$(nproc)
 sudo cmake --install build
-pkill ksystemstats
-/usr/bin/ksystemstats &
+systemctl --user restart plasma-ksystemstats
 ```
+
+Then confirm **Package Power** appears in KDE System Monitor (under "CPU Power (RAPL)") and is
+non-zero at idle.
+
+**Ground truth** — manual RAPL delta, should match the sensor:
+
+```bash
+python3 -c "
+import time
+p = '/sys/class/powercap/intel-rapl:0/energy_uj'   # adjust domain if yours differs
+e1 = int(open(p).read()); t1 = time.monotonic(); time.sleep(5)
+e2 = int(open(p).read()); t2 = time.monotonic()
+print(f'{(e2-e1)/1e6/(t2-t1):.2f} W over {t2-t1:.1f}s')"
+```
+
+**Load test:**
+
+```bash
+stress -c $(nproc) &    # wait ~30 s, watch the sensor, then: kill $!
+```
+
+Expected: idle watts (usually single digits) rising smoothly to full-load watts under `stress`,
+and tracking `k10temp` Tctl from `sensors`. Cross-check against btop's CPU power or Mission
+Control — they read the same counter, so the numbers should agree within a few percent.
+
+Two things that are *not* bugs:
+
+- The reading is a ~1 s average (RAPL's counter is cumulative), so short bursts are smoothed.
+- On APUs the RAPL *package* domain covers the whole chip (CPU + iGPU) — that is the correct
+  package figure. Some platforms also expose a RAPL *core* domain that tracks only a fraction of
+  real core power (on the Lenovo 83M0: ~7 W of ~80 W full-load); the plugin deliberately does not
+  expose it.
 
 ---
 
-## Step 6 — Contribute your findings
+## Step 3 — If a `package` domain exists but the numbers look wrong
 
-Please open a **GitHub issue or pull request** with:
+- Compare against the manual RAPL delta (Step 2) and btop. If those agree with each other but not
+  with `sensors`/fan behaviour, the RAPL domain on this chip may not cover the full package —
+  report it (Step 5).
+- Check for counter wraparound: the counter wraps at `max_energy_range_uj` (a few hundred kJ); the
+  plugin handles the wrap, so this only matters if the domain reports an implausibly large
+  `max_energy_range_uj`.
+- Check `journalctl --user -u plasma-ksystemstats` for the plugin's warnings.
 
-1. Your CPU model and family string (from `ryzenadj --info`)
-2. Your pm_table version and size
-3. The confirmed index mapping table
-4. Your kernel version and Plasma version
+---
 
-This helps future users with the same hardware get working sensors without having to repeat the mapping process.
+## Step 4 — If your chip has no RAPL at all
 
-**Template for your issue:**
+RAPL exposure is **chip-dependent**. This plugin cannot invent a data source; it will register no
+sensors rather than fake a value.
+
+Options:
+
+1. **Wait for kernel support.** In-tree RAPL support for AMD parts has been expanding; newer kernels
+   may expose a `package` domain where older ones did not. Re-check Step 1 after a kernel update.
+2. **Revive the old `ryzen_smu` pm_table path.** The original approach (out-of-tree DKMS module +
+   per-chip float-offset mapping, full procedure in `git show 8fc32e6:ADDING_CPU_SUPPORT.md`) is
+   still available in this repo's history. It works, but it must be rebuilt for *every* kernel and
+   its offsets are per-chip — exactly the fragility this rework removed. Only do this if the chip
+   genuinely has no other package-power source.
+3. **Use another tool** (btop/Mission Control) — they have the same RAPL dependency and will not
+   have the data either.
+
+---
+
+## Step 5 — Contribute your findings
+
+Open a GitHub issue (or PR) so future users with the same hardware know what to expect. Include:
+
+1. CPU model and family (e.g. `lscpu | grep -E 'Model name|CPU family'`)
+2. Kernel version, Plasma version
+3. Output of the Step 1 scan (does a `package*` domain exist? what's its name?)
+4. Measured idle and full-load watts from the sensor, and from btop for cross-check
+5. Anything unexpected (wrong numbers, unreadable counter, no domain)
+
+**Template:**
 
 ```
-CPU: AMD Ryzen X XXXXXX (Family: XXXX)
-pm_table version: XXXXXX
-pm_table size: XXXX bytes (XXX floats)
+CPU: AMD Ryzen X XXXXXX (Family: 0xXX)
+Machine: XXXXXX
 Kernel: X.X.X
 Plasma: X.X.X
 
-Verified index mapping:
-| Index | Sensor | Idle value | Load value |
-|-------|--------|-----------|-----------|
-| XX    | Package Power (W) | X.X | X.X |
-| XX    | PPT Fast Limit (W) | X.X | X.X |
-...
+RAPL: present / absent
+  Domain: intel-rapl:0 -> package-0        (output of Step 1 scan)
+Sensor:  X.X W idle, XX.X W under `stress -c $(nproc)`
+btop:    X.X W idle, XX.X W under load
+Notes:  ...
 ```
 
 ---
 
-## Known mappings
+## Known chips
 
-| CPU Family | Package Power | Tctl | Core temps start | Cores | Notes |
-|---|---|---|---|---|---|
-| Dragon Range (8940HX) | 20 | 11 | 330 | 16 | Verified on HP Omen 16, BIOS F.12 |
-| *Your CPU here* | ? | ? | ? | ? | Please contribute! |
+| CPU (family) | Machine | RAPL `package` domain | Measured | Notes |
+|---|---|---|---|---|
+| Ryzen 7 260 w/ Radeon 780M (0x19) | Lenovo 83M0 | yes — `intel-rapl:0` → `package-0` | 5.6 W idle → 80.8 W load | Verified 2026-09-27; matches btop. RAPL *core* domain present but tracks only ~7 W of full-load package power, so it is not exposed |
+| Ryzen 9 8940HX (Dragon Range) | HP Omen 16 | believed absent (unverified) | — | The original target chip; the old `ryzen_smu` approach existed because this chip had no RAPL source |

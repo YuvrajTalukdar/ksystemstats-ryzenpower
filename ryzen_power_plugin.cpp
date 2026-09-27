@@ -26,7 +26,7 @@ RyzenPowerPlugin::RyzenPowerPlugin(QObject *parent, const QVariantList &args)
     // tracks a small fraction of actual core power (measured ~7 W under full
     // 16-thread load vs ~80 W package), so it is not exposed as a sensor;
     // it would be misleading.
-    m_packageReader = new RaplPowerReader(QStringLiteral("package"));
+    m_packageReader = new RaplPowerReader(QStringLiteral("package"), this);
     if (m_packageReader->isAvailable()) {
         m_packagePower = makeSensor(powerObj, QStringLiteral("package"),
                                     QStringLiteral("Package Power"),
@@ -71,7 +71,11 @@ KSysGuard::SensorProperty *RyzenPowerPlugin::makeSensor(
 void RyzenPowerPlugin::updateValues()
 {
     if (m_packagePower) {
-        const double w = m_packageReader->update();
+        // drain() returns the average power accumulated since the last
+        // drain, no matter who (our timer or ksystemstats' update cycle)
+        // triggered this call; -1.0 means nothing was accumulated, in which
+        // case the previous value is kept.
+        const double w = m_packageReader->drain();
         if (w >= 0.0) {
             m_packagePower->setValue(w);
         }

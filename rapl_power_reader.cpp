@@ -2,10 +2,18 @@
 
 #include <QDebug>
 
-RaplPowerReader::RaplPowerReader(const QString &domainPrefix)
+namespace {
+// Sub-sample period. The RAPL counter range on this platform is ~65.5 kJ, so
+// the counter cannot wrap more than once between two sub-samples at any
+// realistic power (one wrap per 100 ms would require ~655 kW).
+constexpr int SubSampleIntervalMs = 100;
+}
+
+RaplPowerReader::RaplPowerReader(const QString &domainPrefix, QObject *parent)
+    : QObject(parent)
 {
     // Find the RAPL domain whose name starts with domainPrefix.
-    // e.g. "package" -> package-0 (intel-rapl:0), "core" -> core (intel-rapl:0:0)
+    // e.g. "package" -> package-0 (intel-rapl:0)
     const QDir powercap(QStringLiteral("/sys/class/powercap"));
     for (const QFileInfo &fi : powercap.entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot)) {
         QFile nameFile(fi.absoluteFilePath() + QStringLiteral("/name"));
@@ -32,30 +40,33 @@ RaplPowerReader::RaplPowerReader(const QString &domainPrefix)
     if (maxFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
         m_maxUj = QString::fromUtf8(maxFile.readAll()).trimmed().toULongLong(&m_hasMax);
     }
+
+    connect(&m_timer, &QTimer::timeout, this, &RaplPowerReader::sample);
+    m_timer.start(SubSampleIntervalMs);
 }
 
-double RaplPowerReader::update()
+void RaplPowerReader::sample()
 {
     if (m_path.isEmpty()) {
-        return -1.0;
+        return;
     }
 
     QFile f(m_path);
     if (!f.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        return -1.0;
+        return;
     }
     bool ok = false;
     const quint64 cur = QString::fromUtf8(f.readAll()).trimmed().toULongLong(&ok);
     if (!ok) {
-        return -1.0;
+        return;
     }
 
     const auto now = std::chrono::steady_clock::now();
     if (!m_primed) {
         m_lastUj = cur;
-        m_lastTime = now;
+        m_lastSampleTime = now;
         m_primed = true;
-        return -1.0; // first tick: no delta yet
+        return;
     }
 
     // The counter wraps around max_energy_range_uj.
@@ -63,9 +74,19 @@ double RaplPowerReader::update()
         ? (m_hasMax ? (m_maxUj - m_lastUj) + cur : 0)
         : (cur - m_lastUj);
 
-    const double dt = std::chrono::duration_cast<std::chrono::duration<double>>(now - m_lastTime).count();
+    m_accUj += static_cast<double>(diff);
+    m_accSeconds += std::chrono::duration_cast<std::chrono::duration<double>>(now - m_lastSampleTime).count();
     m_lastUj = cur;
-    m_lastTime = now;
+    m_lastSampleTime = now;
+}
 
-    return dt > 0.0 ? static_cast<double>(diff) / (dt * 1e6) : -1.0; // uJ / (s * 1e6) = W
+double RaplPowerReader::drain()
+{
+    if (m_accSeconds <= 0.0) {
+        return -1.0;
+    }
+    const double w = m_accUj / (m_accSeconds * 1e6); // uJ / (s * 1e6) = W
+    m_accUj = 0.0;
+    m_accSeconds = 0.0;
+    return w;
 }

@@ -5,8 +5,16 @@ target machine (LENOVO 83M0, Ryzen 7 260 / Radeon 780M, kernel `7.2.7-arch1-1`).
 
 **Status (2026-09-27): implemented and verified.** The plugin now reads RAPL (`RaplPowerReader`),
 the Package Power sensor is live in KDE System Monitor, and `ryzenadj`/`ryzen_smu` were removed
-from the system. One deviation from the plan: the RAPL *core* domain is not exposed, because on
-this platform it tracks only ~7 W of the ~80 W full-load package power.
+from the system. Two deviations from the plan:
+
+1. The RAPL *core* domain is not exposed, because on this platform it tracks only ~7 W of the ~80 W
+   full-load package power.
+2. §4.1/§4.2 specified computing watts from the delta between successive plugin ticks. In practice
+   ksystemstats also calls a plugin's `update()` on its own ~1 s cycle, so two calls land
+   milliseconds apart and a plain delta measures ~0 ms of energy → the sensor showed a 0/80 W
+   sawtooth under load. Fixed by having `RaplPowerReader` sub-sample the counter internally every
+   100 ms and accumulate the deltas; `drain()` reports the true window average regardless of call
+   timing, and returns -1.0 ("keep previous value") when nothing was accumulated.
 
 ---
 
