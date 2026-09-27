@@ -1,6 +1,6 @@
 #pragma once
 
-#include <QList>
+#include <QString>
 #include <QTimer>
 
 #include <ksysguard/systemstats/SensorContainer.h>
@@ -9,12 +9,14 @@
 #include <ksysguard/systemstats/SensorProperty.h>
 #include <ksysguard/formatter/Unit.h>
 
+#include "rapl_power_reader.h"
+
 class RyzenPowerPlugin : public KSysGuard::SensorPlugin
 {
     Q_OBJECT
 
 public:
-    RyzenPowerPlugin(QObject *parent, const QVariantList &args);
+    explicit RyzenPowerPlugin(QObject *parent, const QVariantList &args);
     QString providerName() const override;
     void update() override;
 
@@ -25,17 +27,8 @@ private:
     static KSysGuard::SensorProperty *makeSensor(
         KSysGuard::SensorObject *obj, const QString &id, const QString &name,
         KSysGuard::Unit unit, qreal min, qreal max);
-    static float readFloat(const QByteArray &data, int index);
 
-    KSysGuard::SensorContainer *m_container   = nullptr;
-    KSysGuard::SensorProperty  *m_pkgPower    = nullptr;
-    KSysGuard::SensorProperty  *m_fastActual  = nullptr;
-    KSysGuard::SensorProperty  *m_slowActual  = nullptr;
-    KSysGuard::SensorProperty  *m_stapmActual = nullptr;
-    KSysGuard::SensorProperty  *m_fastLimit   = nullptr;
-    KSysGuard::SensorProperty  *m_slowLimit   = nullptr;
-    KSysGuard::SensorProperty  *m_stapmLimit  = nullptr;
-    KSysGuard::SensorProperty  *m_tctl        = nullptr;
-    KSysGuard::SensorProperty  *m_hotspot     = nullptr;
-    QList<KSysGuard::SensorProperty *> m_coreTemps;
+    KSysGuard::SensorContainer *m_container = nullptr;
+    RaplPowerReader *m_packageReader = nullptr;
+    KSysGuard::SensorProperty *m_packagePower = nullptr;
 };

@@ -1,8 +1,8 @@
 {
     "KPlugin": {
-        "Name": "Ryzen CPU Power (Dragon Range)",
-        "Description": "CPU package power and temps for AMD Ryzen Dragon Range (8940HX) via ryzen_smu pm_table",
-        "Version": "1.0",
+        "Name": "Ryzen CPU Power (RAPL)",
+        "Description": "CPU package power via the kernel RAPL powercap interface (same source as btop and Mission Control)",
+        "Version": "1.1",
         "License": "LGPL-2.0-or-later",
         "EnabledByDefault": true
     }

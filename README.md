@@ -1,6 +1,7 @@
 # ksystemstats-plugin-ryzen-power
 
-A KDE System Monitor plugin that exposes **real CPU package power consumption** and **per-core temperatures** for AMD Ryzen Dragon Range processors (8940HX and similar) via the `ryzen_smu` kernel module's pm_table.
+A KDE System Monitor plugin that exposes **real CPU package power consumption** via the kernel's
+**RAPL powercap interface** — the same data source used by **btop** and **Mission Control**.
 
 ---
 
@@ -8,55 +9,77 @@ A KDE System Monitor plugin that exposes **real CPU package power consumption** 
 
 ### Why this plugin exists
 
-On AMD laptop CPUs, the obvious way to read CPU power in KDE System Monitor is via the iGPU's `PPT` sensor (reported by the `amdgpu` driver). This works correctly on **monolithic die** chips like the Ryzen 5 5600H (Cezanne) where the CPU cores and iGPU share a single die and a single power domain.
+KDE System Monitor ships **no working CPU power sensor** for AMD systems:
 
-However, **Dragon Range HX chips** (8940HX, 8945HX, etc.) use a **chiplet design**:
-- **CCD** (Core Complex Die) — contains the CPU cores, built on TSMC 4nm
-- **IOD** (I/O Die) — contains the iGPU, memory controller, PCIe, built on TSMC 6nm
+- The **amdgpu PPT** sensor (visible under GPU sensors) reports iGPU/IOD power only. Measured on
+  this machine: ~6 W at idle and only ~15 W under full 8-core CPU load, while the CPU package is
+  actually drawing ~80 W. Useless for CPU power monitoring.
+- The CPU plugin in ksystemstats only exposes CPU *frequency* and *temperature*; the Power plugin
+  is battery-only. There is no RAPL reader anywhere in ksystemstats.
 
-These are **physically separate dies**. The `amdgpu` PPT sensor only sees the IOD (~3-7W at idle), not the CCD where the actual CPU workload runs. Under full CPU load the amdgpu PPT stays near idle levels while the CPU cores consume 60W+ — making it useless for CPU power monitoring.
+**History:** this plugin was originally written for an HP Omen 16 (Ryzen 9 8940HX, "Dragon Range")
+and read power from the `ryzen_smu` kernel module's `pm_table`. That approach required an out-of-tree
+DKMS module that must be rebuilt for *every* kernel (the sensor silently died after a kernel upgrade)
+and its `pm_table` float offsets were mapped for that one specific chip. On **2026-09-27** the plugin
+was reworked to read **RAPL** instead: kernel-native, no DKMS, and the same source that btop and
+Mission Control use. `ryzenadj` and `ryzen_smu` are no longer needed (and have been removed).
 
-This plugin reads directly from the `ryzen_smu` kernel module's `pm_table` binary interface, which reports the true CPU package power from the SMU (System Management Unit) that monitors both dies.
+Research notes for that rework (how btop/Mission Control read power, live measurements, why the old
+approach broke) are in [`plan.md`](plan.md).
 
-### pm_table offset mapping
+### How it works
 
-The Dragon Range pm_table layout is not publicly documented. The offsets used in this plugin were **empirically mapped** by correlating idle vs load values across all 564 float entries:
+The kernel's in-tree `intel_rapl` driver exposes a **cumulative energy counter** (microjoules) at:
 
-| Index | Sensor | Notes |
-|-------|--------|-------|
-| 20 | **CPU Package Power (W)** | Best real-time power metric |
-| 0 | PPT Fast Limit (W) | Set by ryzenadj / EC |
-| 1 | PPT Fast Actual (W) | Current burst power draw |
-| 2 | PPT Slow Limit (W) | Set by ryzenadj / EC |
-| 3 | PPT Slow Actual (W) | Medium-term power draw |
-| 6 | STAPM Limit (W) | Long-term average limit |
-| 5 | STAPM Actual (W) | Rolling average power draw |
-| 11 | Tctl — CPU die temp (°C) | Main die temperature |
-| 69 | Core hotspot (°C) | Highest per-core temp |
-| 330–345 | Core 0–15 temps (°C) | Individual core temperatures |
+```
+/sys/class/powercap/intel-rapl:0/energy_uj     (domain "package-0" = whole CPU package)
+```
 
-Tested on: **HP Omen 16 (8940HX), BIOS F.12, kernel 7.0.3-arch1, Plasma 6.6.4**
+Power in watts is the delta of that counter divided by the elapsed time. This plugin reads the
+counter once per second and publishes the result as a sensor — the exact same algorithm as
+btop (`src/linux/btop_collect.cpp`, `get_cpuConsumptionWatts()`) and Mission Control's magpie backend
+(`platform-linux/src/cpu/power_draw.rs`), including wrap-around handling via `max_energy_range_uj`.
+
+Verified on this machine:
+
+| | Idle | Full 8-core load (`stress -c 16`) |
+|---|---|---|
+| **RAPL package** | **5.6 W** | **80.8 W** |
+| amdgpu PPT | 5.7 W | 15.6 W (wrong for CPU) |
+| k10temp Tctl | 37.6 °C | 91.8 °C |
+
+Notes:
+
+- On an APU the RAPL *package* domain covers the **whole chip** (CPU + iGPU), which is the true
+  package power figure.
+- The RAPL *core* domain also exists on this platform, but it only tracks a small fraction of actual
+  core power (~7 W under full 16-thread load vs ~80 W package), so it is **not** exposed as a sensor —
+  it would be misleading.
 
 ---
 
 ## Requirements
 
-- Arch Linux (or any distro with KDE Plasma 6)
-- KDE Plasma 6.x
-- `ksystemstats` 6.x
-- `libksysguard` 6.x
-- `ryzen_smu` kernel module loaded (provides `/sys/kernel/ryzen_smu_drv/pm_table`)
-- AMD Ryzen Dragon Range CPU (8940HX, 8945HX, or similar HX-class chips)
+- KDE Plasma 6.x with `ksystemstats` 6.x and `libksysguard` 6.x
+- A Linux kernel whose in-tree `intel_rapl` driver exposes a RAPL **package** domain for your CPU.
+  Arch's **mainline and LTS** kernels both ship `intel_rapl_common` + `intel_rapl_msr` in-tree
+  (no DKMS involved), so kernel upgrades do not require any rebuild.
+- No `ryzenadj`, no `ryzen_smu` module.
 
-### Install ryzen_smu
+Tested on: **LENOVO 83M0**, "AMD Ryzen 7 260 w/ Radeon 780M" (CPU family 0x19),
+kernel `7.2.7-arch1-1`, Plasma 6.7.5, ksystemstats 6.7.5.
 
-The `ryzen_smu` module is available from the AUR:
+**Check whether your machine has RAPL:**
+
 ```bash
-yay -S ryzen-smu-dkms
-sudo modprobe ryzen_smu
-# To load at boot:
-echo "ryzen_smu" | sudo tee /etc/modules-load.d/ryzen_smu.conf
+ls /sys/class/powercap/                          # expect: intel-rapl, intel-rapl:0, ...
+cat /sys/class/powercap/intel-rapl:0/name        # expect: package-0
 ```
+
+RAPL exposure is **chip-dependent**: this APU presents an `intel-rapl`-compatible package domain.
+Other chips may not (the original Dragon Range 8940HX did not — that's why the old `ryzen_smu`
+approach existed). If `intel-rapl*` is missing after a kernel change, the plugin logs a warning and
+registers no sensors (it does not fake a value).
 
 ---
 
@@ -65,21 +88,19 @@ echo "ryzen_smu" | sudo tee /etc/modules-load.d/ryzen_smu.conf
 ### Quick install
 
 ```bash
-git clone https://github.com/yourusername/ksystemstats-plugin-ryzen-power
-cd ksystemstats-plugin-ryzen-power
+cd /path/to/ksystemstats-ryzenpower
 ./install.sh
 ```
 
 ### Manual install
 
-**1. Install build dependencies:**
+**1. Build dependencies:**
 ```bash
 sudo pacman -S cmake extra-cmake-modules qt6-base libksysguard
 ```
 
 **2. Build:**
 ```bash
-mkdir -p build
 cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr
 cmake --build build -j$(nproc)
 ```
@@ -89,53 +110,77 @@ cmake --build build -j$(nproc)
 sudo cmake --install build
 ```
 
-**4. Set pm_table permissions** (so ksystemstats can read it without root):
+**4. RAPL read permissions** (same rule Mission Control ships; usually already readable, but this
+makes it stick across reboots/kernel updates):
 ```bash
-sudo cp 99-ryzen-smu-readable.rules /etc/udev/rules.d/
+sudo cp 99-ryzen-powercap-readable.rules /etc/udev/rules.d/
 sudo udevadm control --reload-rules
-sudo chmod a+r /sys/kernel/ryzen_smu_drv/pm_table
+sudo udevadm trigger --subsystem-match=powercap
 ```
 
-**5. Restart ksystemstats:**
+**5. Restart ksystemstats** (no reboot needed):
 ```bash
-pkill ksystemstats
-/usr/bin/ksystemstats &
+systemctl --user restart plasma-ksystemstats
 ```
 
 ---
 
 ## Usage
 
-Open **KDE System Monitor** and search for **"Package Power"** in the sensor picker. The sensors appear under the **"CPU Power (Ryzen)"** category:
+Open **KDE System Monitor** and search for **"Package Power"** in the sensor picker. It appears under
+the **"CPU Power (RAPL)"** category:
 
-- **Package Power (W)** — real-time CPU package power draw. Use this for general monitoring.
-- **PPT Fast Actual (W)** — power draw against the fast (burst) limit
-- **PPT Slow Actual (W)** — power draw against the slow (sustained) limit
-- **STAPM Actual (W)** — rolling time-average power (what the EC enforces long-term)
-- **PPT Fast/Slow/STAPM Limit (W)** — the current limits set by ryzenadj or the EC
-- **Tctl (°C)** — CPU die temperature
-- **Core Hotspot (°C)** — highest individual core temperature
-- **Core 0–15 (°C)** — per-core temperatures
+- **Package Power (W)** — real-time CPU package power (1-second average). This is the number to use
+  for CPU power monitoring; it matches what btop and Mission Control display.
 
-**Which sensor to use for CPU power monitoring:**
-Use **Package Power** — it's the instantaneous SMU reading of actual power consumption, updated every second. STAPM Actual is a smoothed rolling average useful for understanding throttling behaviour.
+**Sanity check** (ground truth, should match the sensor):
+```bash
+python3 -c "
+import time
+p = '/sys/class/powercap/intel-rapl:0/energy_uj'
+e1 = int(open(p).read()); t1 = time.monotonic(); time.sleep(5)
+e2 = int(open(p).read()); t2 = time.monotonic()
+print(f'{(e2-e1)/1e6/(t2-t1):.2f} W over {t2-t1:.1f}s')"
+```
 
 ---
 
-## Sensor explained: Package Power vs STAPM
+## Surviving updates
 
-| Sensor | What it measures | Update rate | Best for |
-|--------|-----------------|-------------|----------|
-| Package Power | Instantaneous draw right now | ~1s | Live monitoring, graphs |
-| PPT Fast Actual | Draw vs burst limit | ~1s | Checking if burst headroom is used |
-| PPT Slow Actual | Draw vs sustained limit | ~1s | Sustained workload monitoring |
-| STAPM Actual | Rolling avg over ~2-5 min | ~1s | Understanding long-term throttling |
+- **Kernel updates:** nothing to do. The plugin is a userspace `.so` (no kernel coupling), and RAPL is
+  in-tree (`intel_rapl_common`/`intel_rapl_msr`) in both Arch mainline and LTS kernels — no DKMS, no
+  rebuild, no per-kernel module. The udev rule is kernel-agnostic.
+  Quick sanity check after switching kernels: `ls /sys/class/powercap/` should still show
+  `intel-rapl*`. If a sensor ever disappears, check
+  `journalctl --user -u plasma-ksystemstats` for the plugin's warning.
+- **ksystemstats / Plasma updates:** the plugin is compiled against `libksysguard`, so after a big
+  Plasma update the sensor may stop appearing (ABI change). Then just rebuild and reinstall:
+  ```bash
+  rm -rf build
+  cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr
+  cmake --build build -j$(nproc)
+  sudo cmake --install build
+  systemctl --user restart plasma-ksystemstats
+  ```
+  To get reminded when ksystemstats updates, add a pacman hook:
+  ```bash
+  sudo tee /etc/pacman.d/hooks/ryzen-plugin-reminder.hook << 'EOF'
+  [Trigger]
+  Operation = Upgrade
+  Type = Package
+  Target = ksystemstats
+  Target = libksysguard
+
+  [Action]
+  Description = Ryzen power plugin may need rebuilding
+  When = PostTransaction
+  Exec = /usr/bin/echo "Rebuild ksystemstats-ryzenpower if Package Power sensor stops working"
+  EOF
+  ```
 
 ---
 
 ## Uninstallation
-
-### Quick uninstall
 
 ```bash
 ./uninstall.sh
@@ -143,85 +188,9 @@ Use **Package Power** — it's the instantaneous SMU reading of actual power con
 
 This removes:
 - `/usr/lib/qt6/plugins/ksystemstats/ksystemstats_plugin_ryzenpower.so` — the plugin itself
-- `/etc/udev/rules.d/99-ryzen-smu-readable.rules` — the udev rule for pm_table permissions
+- `/etc/udev/rules.d/99-ryzen-powercap-readable.rules` — the udev rule for RAPL permissions
 
-It does **not** remove the source folder or build directory. To remove everything:
-```bash
-./uninstall.sh
-rm -rf /path/to/ksystemstats-plugin-ryzen-power
-```
-
-### Manual uninstall
-
-```bash
-sudo rm -f /usr/lib/qt6/plugins/ksystemstats/ksystemstats_plugin_ryzenpower.so
-sudo rm -f /etc/udev/rules.d/99-ryzen-smu-readable.rules
-sudo udevadm control --reload-rules
-pkill ksystemstats
-/usr/bin/ksystemstats &
-```
-
----
-
-## Surviving updates
-
-The plugin is a compiled `.so` loaded by ksystemstats. After KDE/ksystemstats updates:
-
-```bash
-# Check if sensor still appears in System Monitor after an update
-# If not, rebuild:
-cd /path/to/ksystemstats-plugin-ryzen-power
-rm -rf build
-cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr
-cmake --build build -j$(nproc)
-sudo cmake --install build
-pkill ksystemstats
-```
-
-To get reminded automatically when ksystemstats updates, add a pacman hook:
-```bash
-sudo tee /etc/pacman.d/hooks/ryzen-plugin-reminder.hook << 'EOF'
-[Trigger]
-Operation = Upgrade
-Type = Package
-Target = ksystemstats
-Target = libksysguard
-
-[Action]
-Description = Ryzen power plugin may need rebuilding
-When = PostTransaction
-Exec = /usr/bin/echo "Rebuild ~/ksystemstats-plugin-ryzen-power if Package Power sensor stops working"
-EOF
-```
-
----
-
-## Compatibility notes
-
-- Tested on Dragon Range (8940HX). Other HX chips (8945HX, 7945HX) likely share the same pm_table layout but are untested — please open an issue if you verify compatibility.
-- The `ryzenadj --info` command does **not** work on Dragon Range for reading values (returns an error about unsupported family). This plugin reads the pm_table directly, bypassing ryzenadj's monitoring interface entirely.
-- The `amdgpu` PPT sensor visible in KDE System Monitor under GPU sensors reflects **IOD power only** (~3-7W) and is **not** a valid CPU power reading on Dragon Range.
-
----
-
-## Contributing
-
-If you have a different Dragon Range chip and want to verify/extend the pm_table offsets:
-
-```bash
-# Capture idle and load pm_table snapshots
-python3 -c "
-import struct
-with open('/sys/kernel/ryzen_smu_drv/pm_table', 'rb') as f:
-    data = f.read()
-floats = struct.unpack_from(f'{len(data)//4}f', data)
-for i, v in enumerate(floats):
-    if 1 < v < 200 or 30 < v < 110:
-        print(f'[{i:03d}] {v:.3f}')
-"
-```
-
-Run at idle and under `stress -c $(nproc)` and compare — indices that change significantly between idle and load are the power/temp sensors.
+It does **not** remove the source folder or `build/` directory.
 
 ---
 

@@ -15,7 +15,7 @@ else
 fi
 
 # 2. Remove udev rule
-RULE="/etc/udev/rules.d/99-ryzen-smu-readable.rules"
+RULE="/etc/udev/rules.d/99-ryzen-powercap-readable.rules"
 if [ -f "$RULE" ]; then
     echo "[2/3] Removing udev rule..."
     sudo rm -f "$RULE"
@@ -33,6 +33,6 @@ sleep 1
 
 echo ""
 echo "=== Uninstall complete ==="
-echo "The 'CPU Power (Ryzen)' sensors will no longer appear in KDE System Monitor."
+echo "The 'CPU Power (RAPL)' sensors will no longer appear in KDE System Monitor."
 echo "The source folder and build directory have NOT been removed."
 echo "To remove those too: rm -rf $(pwd)"

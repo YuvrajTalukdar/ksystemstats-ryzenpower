@@ -15,7 +15,11 @@ find_package(KF6 REQUIRED COMPONENTS CoreAddons)
 find_package(KSysGuard REQUIRED)
 
 kcoreaddons_add_plugin(ksystemstats_plugin_ryzenpower
-    SOURCES ryzen_power_plugin.cpp ryzen_power_plugin.h
+    SOURCES
+        ryzen_power_plugin.cpp
+        ryzen_power_plugin.h
+        rapl_power_reader.cpp
+        rapl_power_reader.h
     INSTALL_NAMESPACE "ksystemstats"
 )
 

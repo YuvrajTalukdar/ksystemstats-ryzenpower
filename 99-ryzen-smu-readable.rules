@@ -1,2 +1,0 @@
-# Make ryzen_smu pm_table world-readable so ksystemstats plugin can read it without root
-SUBSYSTEM=="module", KERNEL=="ryzen_smu", ACTION=="add", RUN+="/bin/chmod a+r /sys/kernel/ryzen_smu_drv/pm_table"
